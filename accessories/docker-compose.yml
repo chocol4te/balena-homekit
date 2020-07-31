@@ -1,0 +1,10 @@
+version: "2"
+volumes:
+  resin-data:
+services:
+  mqtt_client:
+    build: .
+    network_mode: host
+    restart: always
+    volumes:
+      - "resin-data:/mqtt_client"

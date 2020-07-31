@@ -1,0 +1,13 @@
+[package]
+name = "mqtt_client"
+version = "0.1.0"
+authors = ["Ferdia McKeogh <ferdia@mckeogh.tech>"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0.32"
+tokio = { version = "0.2", features = ["full", "macros"] }
+async-channel = "1.2.0"
+rumqttc = { git = "https://github.com/bytebeamio/rumqtt" }
+pretty_env_logger = "0.4.0"
+color-backtrace = "0.4.2"
