@@ -2,9 +2,11 @@ version: "2"
 volumes:
   resin-data:
 services:
-  mqtt_client:
+  client:
     build: .
     network_mode: host
     restart: always
     volumes:
-      - "resin-data:/mqtt_client"
+      - "resin-data:/client"
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"

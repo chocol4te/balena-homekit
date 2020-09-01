@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 FROM base as rust
 
 # Install build tools
-RUN apt-get -q update && apt-get install -yq --no-install-recommends build-essential curl file
+RUN apt-get -q update && apt-get install -yq --no-install-recommends build-essential curl file pkgconf libssl-dev binutils
 
 # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=923479
 # https://github.com/balena-io-library/base-images/issues/562
@@ -50,7 +50,7 @@ RUN cargo build --release
 #
 # RUN rm -rf target/release/foo-bar target/release/deps/foo_bar-*
 #                              ^                           ^
-RUN rm -rf target/release/mqtt_client* target/release/deps/mqtt_client-*
+RUN rm -rf target/release/client* target/release/deps/client-*
 
 ################################################################################
 # Builder
@@ -72,6 +72,9 @@ COPY --from=dependencies /build/app/target target
 # Build real app
 RUN cargo build --release
 
+# Strip binary of debug symbols
+RUN strip /build/app/target/release/client
+
 ################################################################################
 # Final image
 ################################################################################
@@ -81,10 +84,10 @@ FROM base
 WORKDIR /app
 
 # Copy binary from builder image
-COPY --from=builder /build/app/target/release/mqtt_client .
+COPY --from=builder /build/app/target/release/client .
 
 # Copy other folders required by the application. Example:
 # COPY --from=builder /build/app/assets assets
 
 # Launch application
-CMD ["./mqtt_client"]
+CMD ./client
