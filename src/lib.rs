@@ -2,6 +2,8 @@ use {
     aht20::Aht20,
     anyhow::{anyhow, Result},
     async_channel::Sender,
+    chrono::{DateTime, Utc},
+    influxdb::{Client as DbClient, InfluxDbWriteable},
     linux_embedded_hal::{Delay, I2cdev},
     log::{info, warn},
     rumqttc::{self, EventLoop, MqttOptions, Publish, QoS, Request},
@@ -11,6 +13,26 @@ use {
 };
 
 const I2C_DEV: &str = "/dev/i2c-1";
+const DB_NAME: &str = "environment";
+const INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(InfluxDbWriteable)]
+struct SGP30Reading {
+    time: DateTime<Utc>,
+    co2: i32,
+    voc: i32,
+    #[tag]
+    id: String,
+}
+
+#[derive(InfluxDbWriteable)]
+struct AHT20Reading {
+    time: DateTime<Utc>,
+    humidity: f32,
+    temperature: f32,
+    #[tag]
+    id: String,
+}
 
 pub async fn client() -> Result<()> {
     pretty_env_logger::init();
@@ -18,21 +40,31 @@ pub async fn client() -> Result<()> {
 
     let id = env::var("BALENA_DEVICE_UUID")
         .expect("Failed to find Balena device UUID environment variable");
-    let address = env::var("MQTT_ADDR").expect("Failed to find MQTT_ADDR environment variable");
-    let port = env::var("MQTT_PORT").expect("Failed to find MQTT_PORT environment variable");
+    let mqtt_address =
+        env::var("MQTT_ADDR").expect("Failed to find MQTT_ADDR environment variable");
+    let mqtt_port = env::var("MQTT_PORT").expect("Failed to find MQTT_PORT environment variable");
+    let db_address = env::var("DB_ADDR").expect("Failed to find MQTT_ADDR environment variable");
+    let db_port = env::var("DB_PORT").expect("Failed to find MQTT_PORT environment variable");
 
-    info!("Starting UUID: {}, connecting to {}:{}", id, address, port);
-
+    info!("MQTT connecting to {}:{}", mqtt_address, mqtt_port);
     let mut eventloop = {
-        let mut mqttoptions = MqttOptions::new(&id, address, port.parse()?);
+        let mut mqttoptions = MqttOptions::new(&id, mqtt_address, mqtt_port.parse()?);
         mqttoptions.set_keep_alive(5);
 
         EventLoop::new(mqttoptions, 10).await
     };
 
+    info!("INFLUXDB connecting to {}:{}", db_address, db_port);
+    let db_client = DbClient::new(format!("http://{}:{}", db_address, db_port), DB_NAME);
+
     match init_sgp30() {
         Ok(sensor) => {
-            task::spawn(run_sgp30(id.clone(), eventloop.handle(), sensor));
+            task::spawn(run_sgp30(
+                id.clone(),
+                eventloop.handle(),
+                db_client.clone(),
+                sensor,
+            ));
             info!("Started SGP30 task");
         }
         Err(e) => {
@@ -42,7 +74,12 @@ pub async fn client() -> Result<()> {
 
     match init_aht20() {
         Ok(sensor) => {
-            task::spawn(run_aht20(id.clone(), eventloop.handle(), sensor));
+            task::spawn(run_aht20(
+                id.clone(),
+                eventloop.handle(),
+                db_client.clone(),
+                sensor,
+            ));
             info!("Started AHT20 task");
         }
         Err(e) => {
@@ -69,8 +106,13 @@ fn init_sgp30() -> Result<Sgp30<I2cdev, Delay>> {
     Ok(sgp)
 }
 
-async fn run_sgp30(id: String, sender: Sender<Request>, mut sgp30: Sgp30<I2cdev, Delay>) {
-    let mut interval = interval(Duration::from_secs(1));
+async fn run_sgp30(
+    id: String,
+    sender: Sender<Request>,
+    db: DbClient,
+    mut sgp30: Sgp30<I2cdev, Delay>,
+) {
+    let mut interval = interval(INTERVAL);
     loop {
         interval.tick().await;
 
@@ -160,8 +202,13 @@ fn init_aht20() -> Result<Aht20<I2cdev, Delay>> {
     Aht20::new(dev, Delay).or_else(|e| Err(anyhow!("Failed to initialize AHT20: {:?}", e)))
 }
 
-async fn run_aht20(id: String, sender: Sender<Request>, mut aht20: Aht20<I2cdev, Delay>) {
-    let mut interval = interval(Duration::from_secs(1));
+async fn run_aht20(
+    id: String,
+    sender: Sender<Request>,
+    db: DbClient,
+    mut aht20: Aht20<I2cdev, Delay>,
+) {
+    let mut interval = interval(INTERVAL);
     loop {
         interval.tick().await;
 
@@ -224,5 +271,14 @@ async fn run_aht20(id: String, sender: Sender<Request>, mut aht20: Aht20<I2cdev,
             )))
             .await
             .unwrap();
+
+        // DB
+        let reading = AHT20Reading {
+            time: Utc::now(),
+            humidity,
+            temperature,
+            id: id.clone(),
+        };
+        db.query(&reading.into_query("environment")).await.unwrap();
     }
 }
