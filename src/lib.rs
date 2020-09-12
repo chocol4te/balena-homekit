@@ -1,37 +1,26 @@
 use {
+    crate::sensors::{Measurement, Sensor},
     aht20::Aht20,
-    anyhow::{anyhow, Result},
+    anyhow::Result,
     async_channel::Sender,
-    chrono::{DateTime, Utc},
-    influxdb::{Client as DbClient, InfluxDbWriteable},
-    linux_embedded_hal::{Delay, I2cdev},
+    chrono::Utc,
+    influxdb::{Client as DbClient, WriteQuery},
+    lazy_static::lazy_static,
     log::{info, warn},
     rumqttc::{self, EventLoop, MqttOptions, Publish, QoS, Request},
     sgp30::Sgp30,
-    std::{cmp, env, time::Duration},
-    tokio::{task, time::interval},
+    std::{env, time::Duration},
+    tokio::{sync::Mutex, task, time::interval},
 };
 
-const I2C_DEV: &str = "/dev/i2c-1";
+mod sensors;
+
 const DB_NAME: &str = "environment";
-const INTERVAL: Duration = Duration::from_secs(5);
+const MQTT_INTERVAL: Duration = Duration::from_secs(5);
+const DB_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(InfluxDbWriteable)]
-struct SGP30Reading {
-    time: DateTime<Utc>,
-    co2: i32,
-    voc: i32,
-    #[tag]
-    id: String,
-}
-
-#[derive(InfluxDbWriteable)]
-struct AHT20Reading {
-    time: DateTime<Utc>,
-    humidity: f32,
-    temperature: f32,
-    #[tag]
-    id: String,
+lazy_static! {
+    static ref SENSORS: Mutex<Vec<Box<dyn Sensor + Send + Sync>>> = Mutex::new(vec![]);
 }
 
 pub async fn client() -> Result<()> {
@@ -51,41 +40,25 @@ pub async fn client() -> Result<()> {
         let mut mqttoptions = MqttOptions::new(&id, mqtt_address, mqtt_port.parse()?);
         mqttoptions.set_keep_alive(5);
 
-        EventLoop::new(mqttoptions, 10).await
+        EventLoop::new(mqttoptions, 10)
     };
 
     info!("INFLUXDB connecting to {}:{}", db_address, db_port);
     let db_client = DbClient::new(format!("http://{}:{}", db_address, db_port), DB_NAME);
 
-    match init_sgp30() {
-        Ok(sensor) => {
-            task::spawn(run_sgp30(
-                id.clone(),
-                eventloop.handle(),
-                db_client.clone(),
-                sensor,
-            ));
-            info!("Started SGP30 task");
-        }
-        Err(e) => {
-            warn!("{}", e);
-        }
+    info!("AHT20 initializing");
+    match Aht20::initialize() {
+        Ok(sensor) => SENSORS.lock().await.push(Box::new(sensor)),
+        Err(e) => warn!("{}", e),
+    }
+    info!("SGP30 initializing");
+    match Sgp30::initialize() {
+        Ok(sensor) => SENSORS.lock().await.push(Box::new(sensor)),
+        Err(e) => warn!("{}", e),
     }
 
-    match init_aht20() {
-        Ok(sensor) => {
-            task::spawn(run_aht20(
-                id.clone(),
-                eventloop.handle(),
-                db_client.clone(),
-                sensor,
-            ));
-            info!("Started AHT20 task");
-        }
-        Err(e) => {
-            warn!("{}", e);
-        }
-    }
+    task::spawn(mqtt_task(id.clone(), eventloop.handle()));
+    task::spawn(db_task(id.clone(), db_client));
 
     info!("Initialization complete");
 
@@ -94,18 +67,57 @@ pub async fn client() -> Result<()> {
     }
 }
 
-fn init_sgp30() -> Result<Sgp30<I2cdev, Delay>> {
-    let dev = I2cdev::new(I2C_DEV)?;
-    let address = 0x58;
+async fn mqtt_task(id: String, sender: Sender<Request>) {
+    let mut interval = interval(MQTT_INTERVAL);
+    loop {
+        interval.tick().await;
 
-    let mut sgp = Sgp30::new(dev, address, Delay);
+        let reqs: Vec<Request> = SENSORS
+            .lock()
+            .await
+            .iter_mut()
+            .map(|sensor| sensor.measure().unwrap())
+            .map(|xs| xs.into_iter())
+            .flatten()
+            .map(|m| {
+                Request::Publish(Publish::new(
+                    format!("{}/{}", id, m.name),
+                    QoS::AtLeastOnce,
+                    format!("{}", m.value),
+                ))
+            })
+            .collect();
 
-    sgp.init()
-        .or_else(|e| Err(anyhow!("Failed to initialize SGP30: {:?}", e)))?;
-
-    Ok(sgp)
+        for req in reqs {
+            sender.send(req).await.unwrap();
+        }
+    }
 }
 
+async fn db_task(id: String, db: DbClient) {
+    let mut interval = interval(DB_INTERVAL);
+    loop {
+        interval.tick().await;
+
+        let mut query = WriteQuery::new(Utc::now().into(), DB_NAME).add_tag("id", id.clone());
+
+        let measurements: Vec<Measurement> = SENSORS
+            .lock()
+            .await
+            .iter_mut()
+            .map(|x| x.measure().unwrap())
+            .map(|xs| xs.into_iter())
+            .flatten()
+            .collect();
+
+        for m in measurements {
+            query = query.add_field(m.name, m.value);
+        }
+
+        db.query(&query).await.unwrap();
+    }
+}
+/*
 async fn run_sgp30(
     id: String,
     sender: Sender<Request>,
@@ -196,12 +208,6 @@ async fn run_sgp30(
     }
 }
 
-fn init_aht20() -> Result<Aht20<I2cdev, Delay>> {
-    let dev = I2cdev::new(I2C_DEV)?;
-
-    Aht20::new(dev, Delay).or_else(|e| Err(anyhow!("Failed to initialize AHT20: {:?}", e)))
-}
-
 async fn run_aht20(
     id: String,
     sender: Sender<Request>,
@@ -282,3 +288,4 @@ async fn run_aht20(
         db.query(&reading.into_query("environment")).await.unwrap();
     }
 }
+*/
